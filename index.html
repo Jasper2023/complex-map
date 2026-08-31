@@ -106,7 +106,13 @@
   .pane .title {
     position: absolute; top: 8px; left: 10px; font-size: 13px; color: #aab3c0;
     background: rgba(20,22,26,.65); padding: 2px 7px; border-radius: 4px; pointer-events: none;
+    display: flex; align-items: center; gap: 6px;
   }
+  .hclose {
+    pointer-events: auto; border: none; background: none; color: #6b7484;
+    font-size: 11px; cursor: pointer; padding: 0 2px; line-height: 1;
+  }
+  .hclose:hover { color: #e6e6e6; }
   canvas.layer { position: absolute; left: 0; top: 0; pointer-events: none; background: transparent; }
   canvas { border-radius: 8px; background: #0d0f12; display: block; }
   #left { cursor: grab; }
@@ -132,12 +138,12 @@
   </div>
   <div class="pane">
     <canvas id="left" width="520" height="520"></canvas>
-    <div class="title">z-plane — drag palette items on; drag to move, corners resize, ⌫ deletes</div>
+    <div class="title" id="hintLeft"><span>z-plane — drag palette items on; drag to move, corners resize, ⌫ deletes</span><button class="hclose" title="dismiss">✕</button></div>
   </div>
   <div class="pane">
     <canvas id="right" width="520" height="520"></canvas>
     <canvas id="rightOverlay" class="layer" width="520" height="520"></canvas>
-    <div class="title">w = f(z) — drag to pan, scroll to zoom</div>
+    <div class="title" id="hintRight"><span>w = f(z) — drag to pan, scroll to zoom</span><button class="hclose" title="dismiss">✕</button></div>
   </div>
 </main>
 <footer>

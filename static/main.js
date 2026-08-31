@@ -942,6 +942,19 @@ document.getElementById("file").addEventListener("change", (ev) => {
   ev.target.value = "";
 });
 
+/* dismissable pane instructions (dismissal remembered per pane) */
+for (const [id, key] of [["hintLeft", "complexmap.hintL"], ["hintRight", "complexmap.hintR"]]) {
+  const el = document.getElementById(id);
+  if (!el) continue;
+  let hidden = false;
+  try { hidden = !!localStorage.getItem(key); } catch (e) {}
+  if (hidden) { el.remove(); continue; }
+  el.querySelector(".hclose").addEventListener("click", () => {
+    el.remove();
+    try { localStorage.setItem(key, "1"); } catch (e) {}
+  });
+}
+
 /* ---- boot ---- */
 const GRID_TILES = [
   ["#e8eaee", "#000000", 0.35],
