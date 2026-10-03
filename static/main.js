@@ -715,6 +715,7 @@ function fmt(x) {
     : +x.toFixed(3) + "";
 }
 
+const SNAP_PX = 8;     // axis snapping distance, px (hold ⌥ to disable)
 const HANDLE = 5;      // half-size of corner handle, px
 const HANDLE_HIT = 9;  // hit-test radius, px
 
@@ -772,6 +773,15 @@ function renderLeft() {
     } else {
       lctx.drawImage(layer.item.source, px, py, r.w * ppu, r.h * ppu);
     }
+  }
+  if (snapGuide.x || snapGuide.y) {
+    const [ax, ay] = worldToPix(v, leftCv, 0, 0);
+    lctx.strokeStyle = "rgba(255,190,70,0.95)";
+    lctx.lineWidth = 1.5;
+    lctx.beginPath();
+    if (snapGuide.x) { lctx.moveTo(ax, 0); lctx.lineTo(ax, CSSW); }
+    if (snapGuide.y) { lctx.moveTo(0, ay); lctx.lineTo(CSSW, ay); }
+    lctx.stroke();
   }
   if (state.selected) {
     const r = state.selected.rect;
@@ -877,6 +887,25 @@ function loadState() {
 
 /* ---- z-plane interactions ---- */
 let drag = null;
+const snapGuide = { x: false, y: false }; // which axis a drag is currently snapped to
+
+// Snap a rect's position along one axis so its low edge, centroid or high edge sits on
+// the axis (coordinate 0). Returns the adjusted low coordinate, or null if nothing is close.
+function snapSpan(lo, size, enabled) {
+  if (!enabled) return null;
+  const tol = SNAP_PX * (2 * state.leftView.half) / CSSW;
+  let best = null, bestD = tol;
+  for (const off of [0, size / 2, size]) {
+    const d = Math.abs(lo + off);
+    if (d <= bestD) { bestD = d; best = -off; }
+  }
+  return best;
+}
+// Snap a single coordinate (a dragged edge) onto the axis.
+function snapCoord(c, enabled) {
+  const tol = SNAP_PX * (2 * state.leftView.half) / CSSW;
+  return enabled && Math.abs(c) <= tol ? 0 : null;
+}
 leftCv.addEventListener("pointerdown", (ev) => {
   const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
   const corner = hitCorner(state.selected, ev.offsetX, ev.offsetY);
@@ -891,7 +920,8 @@ leftCv.addEventListener("pointerdown", (ev) => {
     const layer = layerAt(wx, wy);
     if (layer) {
       state.selected = layer;
-      drag = { mode: "layer", layer, wx, wy };
+      // offset from pointer to rect origin, so snapping never accumulates drift
+      drag = { mode: "layer", layer, ox: layer.rect.x - wx, oy: layer.rect.y - wy };
       leftCv.style.cursor = "grabbing";
     } else {
       state.selected = null;
@@ -911,9 +941,14 @@ leftCv.addEventListener("pointermove", (ev) => {
     return;
   }
   if (drag.mode === "resize") {
-    const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
+    let [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
     const r = drag.layer.rect;
     const min = state.leftView.half * 0.02;
+    // edge snapping: the dragged corner's edges land on the axes
+    const sx = snapCoord(wx, !ev.altKey), sy = snapCoord(wy, !ev.altKey);
+    snapGuide.x = sx !== null; snapGuide.y = sy !== null;
+    if (sx !== null) wx = sx;
+    if (sy !== null) wy = sy;
     if (ev.shiftKey || drag.lockAspect) {
       // keep the aspect ratio the rect had when the drag started
       r.w = Math.max(min, Math.max(Math.abs(wx - drag.anchorX), Math.abs(wy - drag.anchorY) / drag.aspect));
@@ -929,9 +964,13 @@ leftCv.addEventListener("pointermove", (ev) => {
   }
   if (drag.mode === "layer") {
     const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
-    drag.layer.rect.x += wx - drag.wx;
-    drag.layer.rect.y += wy - drag.wy;
-    drag.wx = wx; drag.wy = wy;
+    const r = drag.layer.rect;
+    const x = wx + drag.ox, y = wy + drag.oy;
+    // edge + centroid snapping to the imaginary (x = 0) and real (y = 0) axes
+    const sx = snapSpan(x, r.w, !ev.altKey), sy = snapSpan(y, r.h, !ev.altKey);
+    snapGuide.x = sx !== null; snapGuide.y = sy !== null;
+    r.x = sx ?? x;
+    r.y = sy ?? y;
     renderAll();
     return;
   }
@@ -941,7 +980,11 @@ leftCv.addEventListener("pointermove", (ev) => {
   drag.px = ev.offsetX; drag.py = ev.offsetY;
   renderAll();
 });
-const endDrag = () => { drag = null; leftCv.style.cursor = "default"; };
+const endDrag = () => {
+  drag = null;
+  leftCv.style.cursor = "default";
+  if (snapGuide.x || snapGuide.y) { snapGuide.x = snapGuide.y = false; renderLeft(); }
+};
 leftCv.addEventListener("pointerup", endDrag);
 leftCv.addEventListener("pointercancel", endDrag);
 
