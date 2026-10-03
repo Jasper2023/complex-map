@@ -95,6 +95,12 @@
   }
   .pitem:hover .pdel { display: block; }
   .pdel:hover { background: #e05c5c; }
+  .pfill {
+    position: absolute; bottom: 2px; right: 2px; width: 18px; height: 18px;
+    border: none; border-radius: 4px; background: rgba(0,0,0,0.65); color: #fff;
+    font-size: 11px; line-height: 18px; text-align: center; cursor: pointer; padding: 0;
+  }
+  .pfill:hover { background: #2f6fed; }
   #photos:empty::after {
     content: "uploads land here"; font-size: 10px; color: #5b6370;
     display: block; text-align: center; padding: 4px 0;
@@ -133,12 +139,14 @@
   <div id="palette">
     <div class="ptitle">photos</div>
     <div id="photos" class="psec"></div>
-    <div class="ptitle">grids</div>
-    <div id="grids" class="psec"></div>
+    <div class="ptitle">rectangles</div>
+    <div id="rects" class="psec"></div>
+    <div class="ptitle">circles</div>
+    <div id="circles" class="psec"></div>
   </div>
   <div class="pane">
     <canvas id="left" width="520" height="520"></canvas>
-    <div class="title" id="hintLeft"><span>z-plane — drag palette items on; drag to move, corners resize, ⌫ deletes</span><button class="hclose" title="dismiss">✕</button></div>
+    <div class="title" id="hintLeft"><span>z-plane — drag palette items on; drag to move, corners resize, F toggles fill, ⌫ deletes</span><button class="hclose" title="dismiss">✕</button></div>
   </div>
   <div class="pane">
     <canvas id="right" width="520" height="520"></canvas>

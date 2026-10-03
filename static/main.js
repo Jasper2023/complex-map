@@ -161,12 +161,20 @@ precision highp float;
 in vec2 aUV;
 uniform vec4 uRect;   // layer rect in z-plane: x, y (bottom-left), w, h
 uniform vec3 uView;   // w-plane view: center x, center y, half-extent
+uniform int uShape;   // 0 = rect, 1 = circle (ellipse inscribed in uRect)
 out vec2 vUV;
 out vec2 vZ;
 ${GLSL_LIB}
 vec2 f(vec2 z){ return ${fExpr}; }
 void main(){
-  vec2 z = uRect.xy + aUV * uRect.zw;
+  vec2 z;
+  if (uShape == 1) {
+    // polar mesh: aUV.x = radius fraction, aUV.y = angle fraction
+    float a = aUV.y * 6.28318530718;
+    z = uRect.xy + uRect.zw * 0.5 * (1.0 + aUV.x * vec2(cos(a), sin(a)));
+  } else {
+    z = uRect.xy + aUV * uRect.zw;
+  }
   vec2 w = f(z);
   vUV = vec2(aUV.x, 1.0 - aUV.y);
   vZ = z;
@@ -189,23 +197,98 @@ uniform int uIsGrid;
 uniform vec3 uFill;
 uniform vec3 uLine;
 uniform float uSpacing;
+uniform float uDpr;
 out vec4 outColor;
+// coverage of the grid lines (one family per axis) at this fragment, as hairlines of
+// constant screen width: distance to the nearest line is measured in device pixels
+// via the screen-space gradient of z, so lines never thicken or blur under f
+float hairlines(float sp){
+  vec2 d = abs(fract(vZ / sp + 0.5) - 0.5) * sp;           // z-distance to nearest line
+  vec2 g = vec2(length(vec2(dFdx(vZ.x), dFdy(vZ.x))),
+                length(vec2(dFdx(vZ.y), dFdy(vZ.y))));     // z per device pixel
+  g = max(g, vec2(1e-12));
+  vec2 px = d / g;
+  vec2 cov = clamp(1.0 - px, 0.0, 1.0);                     // 1 device px wide, antialiased
+  cov *= smoothstep(2.0, 6.0, sp / g * (1.0 / uDpr));      // fade where lines crowd < ~4px apart
+  return max(cov.x, cov.y);
+}
 void main(){
   if (uIsGrid == 1) {
-    // world-aligned graph paper: minor lines every uSpacing, major every 4x
-    float sp = uSpacing;
-    vec2 d1 = abs(fract(vZ / sp + 0.5) - 0.5) * sp;
-    float sp2 = sp * 4.0;
-    vec2 d2 = abs(fract(vZ / sp2 + 0.5) - 0.5) * sp2;
-    float lw = sp * 0.02;
-    float a1 = 1.0 - smoothstep(lw * 0.7, lw * 1.3, min(d1.x, d1.y));
-    float lw2 = sp * 0.04;
-    float a2 = 1.0 - smoothstep(lw2 * 0.7, lw2 * 1.3, min(d2.x, d2.y));
-    outColor = vec4(mix(uFill, uLine, max(a1, a2)), 1.0);
+    // world-aligned graph paper: hairlines every uSpacing
+    outColor = vec4(mix(uFill, uLine, hairlines(uSpacing)), 1.0);
   } else {
     outColor = texture(uTex, vUV);
   }
 }`;
+
+// Outline of a shape pushed through f, drawn as a constant-pixel-width band.
+// Each boundary segment is its own quad (6 verts) so a segment that jumps across
+// a branch cut or pole can be culled whole.
+const LINE_SEGS = 2048;
+const LINE_HALF_PX = 1.25; // half line width, CSS px
+
+function lineVertexSrc(fExpr) {
+  return `#version 300 es
+precision highp float;
+in vec3 aSeg;         // segment start t in [0,1), end flag (0/1), side (-1/+1)
+uniform vec4 uRect;
+uniform vec3 uView;
+uniform int uShape;
+uniform float uStep;  // boundary parameter per segment
+uniform float uHalfW; // half line width, clip units
+${GLSL_LIB}
+vec2 f(vec2 z){ return ${fExpr}; }
+vec2 boundary(float t){
+  t = fract(t);
+  if (uShape == 1) {
+    float a = t * 6.28318530718;
+    return uRect.xy + uRect.zw * 0.5 * (1.0 + vec2(cos(a), sin(a)));
+  }
+  // rect, counter-clockwise from bottom-left
+  float s = t * 4.0, side = floor(s), u = s - side;
+  vec2 p0 = uRect.xy, p1 = uRect.xy + vec2(uRect.z, 0.0);
+  vec2 p2 = uRect.xy + uRect.zw, p3 = uRect.xy + vec2(0.0, uRect.w);
+  if (side < 1.0) return mix(p0, p1, u);
+  if (side < 2.0) return mix(p1, p2, u);
+  if (side < 3.0) return mix(p2, p3, u);
+  return mix(p3, p0, u);
+}
+bool bad(vec2 w){ return isnan(w.x) || isnan(w.y) || isinf(w.x) || isinf(w.y); }
+vec2 toClip(vec2 w){ return (clamp(w, vec2(-1e5), vec2(1e5)) - uView.xy) / uView.z; }
+const float JUMP = 0.5; // clip-space segment length treated as a discontinuity
+void main(){
+  float t = aSeg.x + aSeg.y * uStep;
+  vec2 wa = f(boundary(t - uStep)), wc = f(boundary(t)), wb = f(boundary(t + uStep));
+  vec2 pa = toClip(wa), pc = toClip(wc), pb = toClip(wb);
+  // the other end of this vertex's own segment
+  bool partnerBad = aSeg.y < 0.5 ? bad(wb) : bad(wa);
+  vec2 partner = aSeg.y < 0.5 ? pb : pa;
+  if (bad(wc) || partnerBad || length(partner - pc) > JUMP) {
+    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+    return;
+  }
+  vec2 da = pc - pa, db = pb - pc;
+  float la = length(da), lb = length(db);
+  bool okA = !bad(wa) && la > 1e-9 && la < JUMP;
+  bool okB = !bad(wb) && lb > 1e-9 && lb < JUMP;
+  vec2 na = okA ? vec2(-da.y, da.x) / la : vec2(0.0);
+  vec2 nb = okB ? vec2(-db.y, db.x) / lb : vec2(0.0);
+  vec2 n = okA ? na : nb;
+  if (okA && okB) {
+    // miter join
+    vec2 m = na + nb;
+    float ml = length(m);
+    if (ml > 1e-6) { n = m / ml; n /= max(dot(n, na), 0.25); }
+  }
+  gl_Position = vec4(pc + n * aSeg.z * uHalfW, 0.0, 1.0);
+}`;
+}
+
+const LINE_FRAG_SRC = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main(){ outColor = vec4(uColor, 1.0); }`;
 
 /* ============ app state ============ */
 
@@ -230,11 +313,12 @@ const gl = rightCv.getContext("webgl2", { antialias: true });
 let fnInput = document.getElementById("fn");
 const errEl = document.getElementById("err");
 const photosEl = document.getElementById("photos");
-const gridsEl = document.getElementById("grids");
+const rectsEl = document.getElementById("rects");
+const circlesEl = document.getElementById("circles");
 
 const state = {
   palette: [],                              // {id, source, aspect, tex}
-  layers: [],                               // {item, rect:{x,y,w,h}} in draw order
+  layers: [],                               // {item, rect:{x,y,w,h}, filled} in draw order
   selected: null,                           // a layer, or null
   leftView: { cx: 0, cy: 0, half: 3 },
   rightView: { cx: 0, cy: 0, half: 4 },
@@ -270,6 +354,32 @@ const idxBuf = gl.createBuffer();
 gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
 gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
 
+// outline band: 6 verts per boundary segment, each (t0, endFlag, side)
+const LINE_CORNERS = [[0, -1], [0, 1], [1, -1], [1, -1], [0, 1], [1, 1]];
+const lineVerts = new Float32Array(LINE_SEGS * 6 * 3);
+k = 0;
+for (let sg = 0; sg < LINE_SEGS; sg++)
+  for (const [end, side] of LINE_CORNERS) {
+    lineVerts[k++] = sg / LINE_SEGS; lineVerts[k++] = end; lineVerts[k++] = side;
+  }
+const lineBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+gl.bufferData(gl.ARRAY_BUFFER, lineVerts, gl.STATIC_DRAW);
+
+// both programs bind their single attribute to location 0
+const vaoFill = gl.createVertexArray();
+gl.bindVertexArray(vaoFill);
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+const vaoLine = gl.createVertexArray();
+gl.bindVertexArray(vaoLine);
+gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
 gl.enable(gl.BLEND);
 gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
@@ -288,7 +398,8 @@ function makeTexture(source) {
   return t;
 }
 
-function paletteDom(item, thumbCanvas, label, isPhoto) {
+function paletteDom(item, thumbCanvas, label, sectionEl) {
+  const isPhoto = item.kind === "photo";
   const div = document.createElement("div");
   div.className = isPhoto ? "pitem photo" : "pitem";
   div.draggable = true;
@@ -308,8 +419,26 @@ function paletteDom(item, thumbCanvas, label, isPhoto) {
       removePaletteItem(item, div);
     });
     div.appendChild(del);
+  } else {
+    // filled / outline toggle: sets how this tile lands on the plane
+    const tog = document.createElement("button");
+    tog.className = "pfill";
+    const sync = () => {
+      tog.textContent = item.filled ? "●" : "○";
+      tog.title = item.filled ? "filled — click for outline only" : "outline — click for filled";
+      drawShapeThumb(thumbCanvas, item);
+    };
+    tog.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      item.filled = !item.filled;
+      sync();
+      scheduleSave();
+    });
+    item.syncToggle = sync;
+    sync();
+    div.appendChild(tog);
   }
-  (isPhoto ? photosEl : gridsEl).appendChild(div);
+  sectionEl.appendChild(div);
 }
 
 function addPhotoItem(source, label, dataURL) {
@@ -331,7 +460,7 @@ function addPhotoItem(source, label, dataURL) {
   thumb.style.width = cssW + "px";
   thumb.style.height = cssH + "px";
   thumb.getContext("2d").drawImage(source, 0, 0, thumb.width, thumb.height);
-  paletteDom(item, thumb, label, true);
+  paletteDom(item, thumb, label, photosEl);
   return item;
 }
 
@@ -340,21 +469,27 @@ function hexToRgb(h) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-function addGridItem(fillHex, lineHex, lineAlpha, label) {
+function addGridItem(fillHex, lineHex, lineAlpha, label, shape) {
   const fill = hexToRgb(fillHex);
   const base = hexToRgb(lineHex);
   const line = fill.map((c, i) => Math.round(c * (1 - lineAlpha) + base[i] * lineAlpha));
   const item = {
     id: nextId++,
     kind: "grid",
+    shape,                                  // "rect" | "circle"
+    filled: true,                           // palette toggle: how new layers land
     aspect: 1,
     fill: fill.map((c) => c / 255),
     line: line.map((c) => c / 255),
     fillCss: fillHex,
     lineCss: `rgb(${line.join(",")})`,
+    thumbLineCss: `rgba(${base.join(",")},${lineAlpha})`,
   };
   state.palette.push(item);
-  paletteDom(item, makeGridThumb(fillHex, `rgba(${base.join(",")},${lineAlpha})`), label, false);
+  const thumb = document.createElement("canvas");
+  thumb.width = thumb.height = Math.round(72 * DPR);
+  thumb.style.width = thumb.style.height = "72px";
+  paletteDom(item, thumb, label, shape === "circle" ? circlesEl : rectsEl);
   return item;
 }
 
@@ -372,13 +507,28 @@ function removePaletteItem(item, div) {
 const GRID_SPACING = 0.25;
 
 // 72px (device-resolution) thumbnail drawn at thumb scale so the gridding is visible
-function makeGridThumb(fill, line) {
-  const S = Math.round(72 * DPR);
-  const c = document.createElement("canvas");
-  c.width = c.height = S;
-  c.style.width = c.style.height = "72px";
+function drawShapeThumb(c, item) {
+  const S = c.width;
   const g = c.getContext("2d");
-  g.fillStyle = fill;
+  g.clearRect(0, 0, S, S);
+  if (!item.filled) {
+    g.strokeStyle = item.fillCss;
+    g.lineWidth = 3 * DPR;
+    const m = 8 * DPR;
+    g.beginPath();
+    if (item.shape === "circle") g.arc(S / 2, S / 2, S / 2 - m, 0, 2 * Math.PI);
+    else g.rect(m, m, S - 2 * m, S - 2 * m);
+    g.stroke();
+    return;
+  }
+  g.save();
+  if (item.shape === "circle") {
+    g.beginPath();
+    g.arc(S / 2, S / 2, S / 2 - DPR, 0, 2 * Math.PI);
+    g.clip();
+  }
+  const line = item.thumbLineCss;
+  g.fillStyle = item.fillCss;
   g.fillRect(0, 0, S, S);
   g.strokeStyle = line;
   g.lineWidth = DPR;
@@ -387,10 +537,9 @@ function makeGridThumb(fill, line) {
     g.beginPath(); g.moveTo(p, 0); g.lineTo(p, S); g.stroke();
     g.beginPath(); g.moveTo(0, p); g.lineTo(S, p); g.stroke();
   }
-  g.lineWidth = 2 * DPR;
   g.beginPath(); g.moveTo(S / 2, 0); g.lineTo(S / 2, S); g.stroke();
   g.beginPath(); g.moveTo(0, S / 2); g.lineTo(S, S / 2); g.stroke();
-  return c;
+  g.restore();
 }
 
 
@@ -398,7 +547,7 @@ function makeGridThumb(fill, line) {
 function addLayer(item, cx, cy, width) {
   const w = width || state.leftView.half * 0.66;
   const h = w * item.aspect;
-  const layer = { item, rect: { x: cx - w / 2, y: cy - h / 2, w, h } };
+  const layer = { item, rect: { x: cx - w / 2, y: cy - h / 2, w, h }, filled: item.kind !== "grid" || item.filled };
   state.layers.push(layer);
   state.selected = layer;
   renderAll();
@@ -425,13 +574,13 @@ function compileShader(type, src) {
   return s;
 }
 
-function setFunction(src) {
-  const expr = compileExpr(src); // throws on parse error
-  const vs = compileShader(gl.VERTEX_SHADER, vertexSrc(expr));
-  const fs = compileShader(gl.FRAGMENT_SHADER, FRAG_SRC);
+function linkProgram(vsSrc, fsSrc, attrib) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
   const prog = gl.createProgram();
   gl.attachShader(prog, vs);
   gl.attachShader(prog, fs);
+  gl.bindAttribLocation(prog, 0, attrib);
   gl.linkProgram(prog);
   gl.deleteShader(vs);
   gl.deleteShader(fs);
@@ -440,18 +589,36 @@ function setFunction(src) {
     gl.deleteProgram(prog);
     throw new Error(log);
   }
+  return prog;
+}
+
+function setFunction(src) {
+  const expr = compileExpr(src); // throws on parse error
+  const prog = linkProgram(vertexSrc(expr), FRAG_SRC, "aUV");
+  let lprog;
+  try {
+    lprog = linkProgram(lineVertexSrc(expr), LINE_FRAG_SRC, "aSeg");
+  } catch (e) {
+    gl.deleteProgram(prog);
+    throw e;
+  }
   if (state.program) gl.deleteProgram(state.program);
+  if (state.lineProgram) gl.deleteProgram(state.lineProgram);
   state.program = prog;
   state.uRect = gl.getUniformLocation(prog, "uRect");
   state.uView = gl.getUniformLocation(prog, "uView");
+  state.uShape = gl.getUniformLocation(prog, "uShape");
   state.uIsGrid = gl.getUniformLocation(prog, "uIsGrid");
   state.uFill = gl.getUniformLocation(prog, "uFill");
   state.uLine = gl.getUniformLocation(prog, "uLine");
   state.uSpacing = gl.getUniformLocation(prog, "uSpacing");
-  const loc = gl.getAttribLocation(prog, "aUV");
-  gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
-  gl.enableVertexAttribArray(loc);
-  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  state.uDpr = gl.getUniformLocation(prog, "uDpr");
+  const u = (n) => gl.getUniformLocation(lprog, n);
+  state.lineProgram = lprog;
+  state.lu = {
+    rect: u("uRect"), view: u("uView"), shape: u("uShape"),
+    step: u("uStep"), halfW: u("uHalfW"), color: u("uColor"),
+  };
 }
 
 /* ---- rendering ---- */
@@ -460,24 +627,41 @@ function renderRight() {
   gl.clearColor(0.05, 0.06, 0.07, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
   if (state.program) {
-    gl.useProgram(state.program);
     const v = state.rightView;
-    gl.uniform3f(state.uView, v.cx, v.cy, v.half);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
     for (const layer of state.layers) {
       const r = layer.rect, it = layer.item;
+      const shape = it.shape === "circle" ? 1 : 0;
+      if (!layer.filled) {
+        const lu = state.lu;
+        gl.useProgram(state.lineProgram);
+        gl.bindVertexArray(vaoLine);
+        gl.uniform3f(lu.view, v.cx, v.cy, v.half);
+        gl.uniform4f(lu.rect, r.x, r.y, r.w, r.h);
+        gl.uniform1i(lu.shape, shape);
+        gl.uniform1f(lu.step, 1 / LINE_SEGS);
+        gl.uniform1f(lu.halfW, LINE_HALF_PX * 2 / CSSW);
+        gl.uniform3f(lu.color, it.fill[0], it.fill[1], it.fill[2]);
+        gl.drawArrays(gl.TRIANGLES, 0, LINE_SEGS * 6);
+        continue;
+      }
+      gl.useProgram(state.program);
+      gl.bindVertexArray(vaoFill);
+      gl.uniform3f(state.uView, v.cx, v.cy, v.half);
       gl.uniform4f(state.uRect, r.x, r.y, r.w, r.h);
+      gl.uniform1i(state.uShape, shape);
       if (it.kind === "grid") {
         gl.uniform1i(state.uIsGrid, 1);
         gl.uniform3f(state.uFill, it.fill[0], it.fill[1], it.fill[2]);
         gl.uniform3f(state.uLine, it.line[0], it.line[1], it.line[2]);
         gl.uniform1f(state.uSpacing, GRID_SPACING);
+        gl.uniform1f(state.uDpr, DPR);
       } else {
         gl.uniform1i(state.uIsGrid, 0);
         gl.bindTexture(gl.TEXTURE_2D, it.tex);
       }
       gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
     }
+    gl.bindVertexArray(null);
   }
   drawAxes(octx, overlayCv, state.rightView, true);
   scheduleSave();
@@ -554,10 +738,20 @@ function hitCorner(layer, px, py) {
 }
 function layerAt(wx, wy) {
   for (let i = state.layers.length - 1; i >= 0; i--) {
-    const r = state.layers[i].rect;
-    if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return state.layers[i];
+    const l = state.layers[i], r = l.rect;
+    if (l.item.shape === "circle") {
+      const dx = (wx - r.x - r.w / 2) / (r.w / 2), dy = (wy - r.y - r.h / 2) / (r.h / 2);
+      if (dx * dx + dy * dy <= 1) return l;
+    } else if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return l;
   }
   return null;
+}
+
+// adds the layer's outline (rect or inscribed ellipse) to the current path
+function shapePath(ctx, layer, px, py, pw, ph) {
+  ctx.beginPath();
+  if (layer.item.shape === "circle") ctx.ellipse(px + pw / 2, py + ph / 2, pw / 2, ph / 2, 0, 0, 2 * Math.PI);
+  else ctx.rect(px, py, pw, ph);
 }
 
 function renderLeft() {
@@ -568,7 +762,12 @@ function renderLeft() {
   for (const layer of state.layers) {
     const r = layer.rect;
     const [px, py] = worldToPix(v, leftCv, r.x, r.y + r.h);
-    if (layer.item.kind === "grid") {
+    if (layer.item.kind === "grid" && !layer.filled) {
+      shapePath(lctx, layer, px, py, r.w * ppu, r.h * ppu);
+      lctx.strokeStyle = layer.item.fillCss;
+      lctx.lineWidth = LINE_HALF_PX * 2;
+      lctx.stroke();
+    } else if (layer.item.kind === "grid") {
       drawGridWindow(layer, px, py, r.w * ppu, r.h * ppu);
     } else {
       lctx.drawImage(layer.item.source, px, py, r.w * ppu, r.h * ppu);
@@ -596,25 +795,27 @@ function renderLeft() {
 // draw a grid layer in the z-plane as a window onto the fixed world-aligned grid
 function drawGridWindow(layer, px, py, pw, ph) {
   const v = state.leftView, r = layer.rect, it = layer.item;
-  const ppu = CSSW / (2 * v.half);
+  // hairlines: one device pixel wide at any zoom, snapped to pixel centers
+  const snap = (p) => (Math.floor(p * DPR) + 0.5) / DPR;
   lctx.save();
-  lctx.beginPath();
-  lctx.rect(px, py, pw, ph);
+  shapePath(lctx, layer, px, py, pw, ph);
   lctx.clip();
   lctx.fillStyle = it.fillCss;
   lctx.fillRect(px, py, pw, ph);
   lctx.strokeStyle = it.lineCss;
-  const major = GRID_SPACING * 4;
-  for (const [sp, lw] of [[GRID_SPACING, Math.max(0.5, 0.01 * ppu)], [major, Math.max(1, 0.02 * ppu)]]) {
-    lctx.lineWidth = lw;
+  lctx.lineWidth = 1 / DPR;
+  const sp = GRID_SPACING;
+  if (sp * CSSW / (2 * v.half) >= 3) { // skip when lines would crowd into a solid wash
+    lctx.beginPath();
     for (let x = Math.ceil(r.x / sp) * sp; x <= r.x + r.w; x += sp) {
-      const [gx] = worldToPix(v, leftCv, x, 0);
-      lctx.beginPath(); lctx.moveTo(gx, py); lctx.lineTo(gx, py + ph); lctx.stroke();
+      const gx = snap(worldToPix(v, leftCv, x, 0)[0]);
+      lctx.moveTo(gx, py); lctx.lineTo(gx, py + ph);
     }
     for (let y = Math.ceil(r.y / sp) * sp; y <= r.y + r.h; y += sp) {
-      const [, gy] = worldToPix(v, leftCv, 0, y);
-      lctx.beginPath(); lctx.moveTo(px, gy); lctx.lineTo(px + pw, gy); lctx.stroke();
+      const gy = snap(worldToPix(v, leftCv, 0, y)[1]);
+      lctx.moveTo(px, gy); lctx.lineTo(px + pw, gy);
     }
+    lctx.stroke();
   }
   lctx.restore();
 }
@@ -653,9 +854,10 @@ function saveState() {
       leftView: state.leftView,
       rightView: state.rightView,
       photos: photos.map((p) => ({ url: p.dataURL || (p.dataURL = shrinkToDataURL(p.source)) })),
+      tileFilled: grids.map((g) => g.filled),
       layers: state.layers.map((l) =>
         l.item.kind === "grid"
-          ? { kind: "grid", i: grids.indexOf(l.item), rect: l.rect }
+          ? { kind: "grid", i: grids.indexOf(l.item), rect: l.rect, filled: l.filled }
           : { kind: "photo", i: photos.indexOf(l.item), rect: l.rect }
       ),
     };
@@ -683,7 +885,8 @@ leftCv.addEventListener("pointerdown", (ev) => {
     // anchor = opposite corner stays fixed
     const anchorX = corner & 1 ? r.x : r.x + r.w;
     const anchorY = corner & 2 ? r.y : r.y + r.h;
-    drag = { mode: "resize", layer: state.selected, anchorX, anchorY, aspect: r.h / r.w };
+    drag = { mode: "resize", layer: state.selected, anchorX, anchorY, aspect: r.h / r.w,
+             lockAspect: state.selected.item.shape === "circle" };
   } else {
     const layer = layerAt(wx, wy);
     if (layer) {
@@ -711,7 +914,7 @@ leftCv.addEventListener("pointermove", (ev) => {
     const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
     const r = drag.layer.rect;
     const min = state.leftView.half * 0.02;
-    if (ev.shiftKey) {
+    if (ev.shiftKey || drag.lockAspect) {
       // keep the aspect ratio the rect had when the drag started
       r.w = Math.max(min, Math.max(Math.abs(wx - drag.anchorX), Math.abs(wy - drag.anchorY) / drag.aspect));
       r.h = r.w * drag.aspect;
@@ -771,8 +974,15 @@ leftCv.addEventListener("drop", (ev) => {
 });
 
 window.addEventListener("keydown", (ev) => {
-  if (ev.key !== "Delete" && ev.key !== "Backspace") return;
   if (document.activeElement === fnInput) return;
+  if ((ev.key === "f" || ev.key === "F") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    if (state.selected && state.selected.item.kind === "grid") {
+      state.selected.filled = !state.selected.filled;
+      renderAll();
+    }
+    return;
+  }
+  if (ev.key !== "Delete" && ev.key !== "Backspace") return;
   if (state.selected) {
     ev.preventDefault();
     deleteLayer(state.selected);
@@ -964,10 +1174,11 @@ const GRID_TILES = [
   ["#8b5cf6", "#ffffff", 0.55],
 ];
 let firstTile = null;
-for (const [fill, lineBase, alpha] of GRID_TILES) {
-  const item = addGridItem(fill, lineBase, alpha, fill + " grid");
-  if (fill === "#8b5cf6") firstTile = item;
-}
+for (const shape of ["rect", "circle"])
+  for (const [fill, lineBase, alpha] of GRID_TILES) {
+    const item = addGridItem(fill, lineBase, alpha, `${fill} ${shape === "circle" ? "circle" : "rectangle"}`, shape);
+    if (fill === "#8b5cf6" && shape === "rect") firstTile = item;
+  }
 
 const saved = loadState();
 if (saved && Array.isArray(saved.layers)) {
@@ -978,6 +1189,9 @@ if (saved && Array.isArray(saved.layers)) {
     else fnInput.textContent = saved.fn; // MathLive reads content when it upgrades
   }
   const gridItems = state.palette.filter((p) => p.kind === "grid");
+  (saved.tileFilled || []).forEach((f, i) => {
+    if (gridItems[i] && f === false) { gridItems[i].filled = false; gridItems[i].syncToggle(); }
+  });
   Promise.all(
     (saved.photos || []).map(
       (p) =>
@@ -991,7 +1205,7 @@ if (saved && Array.isArray(saved.layers)) {
   ).then((photoItems) => {
     for (const l of saved.layers) {
       const item = l.kind === "grid" ? gridItems[l.i] : photoItems[l.i];
-      if (item && l.rect) state.layers.push({ item, rect: l.rect });
+      if (item && l.rect) state.layers.push({ item, rect: l.rect, filled: item.kind !== "grid" || l.filled !== false });
     }
     renderAll();
   });
