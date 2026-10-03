@@ -774,15 +774,6 @@ function renderLeft() {
       lctx.drawImage(layer.item.source, px, py, r.w * ppu, r.h * ppu);
     }
   }
-  if (snapGuide.x || snapGuide.y) {
-    const [ax, ay] = worldToPix(v, leftCv, 0, 0);
-    lctx.strokeStyle = "rgba(255,190,70,0.95)";
-    lctx.lineWidth = 1.5;
-    lctx.beginPath();
-    if (snapGuide.x) { lctx.moveTo(ax, 0); lctx.lineTo(ax, CSSW); }
-    if (snapGuide.y) { lctx.moveTo(0, ay); lctx.lineTo(CSSW, ay); }
-    lctx.stroke();
-  }
   if (state.selected) {
     const r = state.selected.rect;
     const [px, py] = worldToPix(v, leftCv, r.x, r.y + r.h);
@@ -887,7 +878,6 @@ function loadState() {
 
 /* ---- z-plane interactions ---- */
 let drag = null;
-const snapGuide = { x: false, y: false }; // which axis a drag is currently snapped to
 
 // Snap a rect's position along one axis so its low edge, centroid or high edge sits on
 // the axis (coordinate 0). Returns the adjusted low coordinate, or null if nothing is close.
@@ -946,7 +936,6 @@ leftCv.addEventListener("pointermove", (ev) => {
     const min = state.leftView.half * 0.02;
     // edge snapping: the dragged corner's edges land on the axes
     const sx = snapCoord(wx, !ev.altKey), sy = snapCoord(wy, !ev.altKey);
-    snapGuide.x = sx !== null; snapGuide.y = sy !== null;
     if (sx !== null) wx = sx;
     if (sy !== null) wy = sy;
     if (ev.shiftKey || drag.lockAspect) {
@@ -968,7 +957,6 @@ leftCv.addEventListener("pointermove", (ev) => {
     const x = wx + drag.ox, y = wy + drag.oy;
     // edge + centroid snapping to the imaginary (x = 0) and real (y = 0) axes
     const sx = snapSpan(x, r.w, !ev.altKey), sy = snapSpan(y, r.h, !ev.altKey);
-    snapGuide.x = sx !== null; snapGuide.y = sy !== null;
     r.x = sx ?? x;
     r.y = sy ?? y;
     renderAll();
@@ -980,11 +968,7 @@ leftCv.addEventListener("pointermove", (ev) => {
   drag.px = ev.offsetX; drag.py = ev.offsetY;
   renderAll();
 });
-const endDrag = () => {
-  drag = null;
-  leftCv.style.cursor = "default";
-  if (snapGuide.x || snapGuide.y) { snapGuide.x = snapGuide.y = false; renderLeft(); }
-};
+const endDrag = () => { drag = null; leftCv.style.cursor = "default"; };
 leftCv.addEventListener("pointerup", endDrag);
 leftCv.addEventListener("pointercancel", endDrag);
 
