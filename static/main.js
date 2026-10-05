@@ -168,7 +168,8 @@ function vertexSrc(fExpr) {
 precision highp float;
 in vec2 aUV;
 uniform vec4 uRect;   // layer rect in z-plane: x, y (bottom-left), w, h
-uniform vec3 uView;   // w-plane view: center x, center y, half-extent
+uniform vec3 uView;   // w-plane view: center x, center y, vertical half-extent
+uniform float uAspect; // canvas width / height
 uniform int uShape;   // 0 = rect, 1 = circle (ellipse inscribed in uRect), 2 = semicircle
 uniform int uRot;     // semicircle: quarter turns counter-clockwise
 out vec2 vUV;
@@ -198,7 +199,7 @@ void main(){
   }
   w = clamp(w, vec2(-1e5), vec2(1e5));
   vec2 p = (w - uView.xy) / uView.z;
-  gl_Position = vec4(p, 0.0, 1.0);
+  gl_Position = vec4(p.x / uAspect, p.y, 0.0, 1.0);
 }`;
 }
 
@@ -258,6 +259,7 @@ precision highp float;
 in vec3 aSeg;         // segment start t in [0,1), end flag (0/1), side (-1/+1)
 uniform vec4 uRect;
 uniform vec3 uView;
+uniform float uAspect;
 uniform int uShape;
 uniform int uRot;
 uniform float uStep;  // boundary parameter per segment
@@ -317,7 +319,9 @@ void main(){
     float ml = length(m);
     if (ml > 1e-6) { n = m / ml; n /= max(dot(n, na), 0.25); }
   }
-  gl_Position = vec4(pc + n * aSeg.z * uHalfW, 0.0, 1.0);
+  // normals were built in isotropic (y-clip) units; squeeze x into clip space last
+  vec2 q = pc + n * aSeg.z * uHalfW;
+  gl_Position = vec4(q.x / uAspect, q.y, 0.0, 1.0);
 }`;
 }
 
@@ -342,16 +346,34 @@ const overlayCv = document.getElementById("rightOverlay");
 
 // render at device resolution, lay out / do math in CSS pixels
 const DPR = Math.min(3, window.devicePixelRatio || 1);
-const CSSW = 520;
-for (const cv of [leftCv, rightCv, overlayCv]) {
-  cv.width = cv.height = Math.round(CSSW * DPR);
-  cv.style.width = cv.style.height = CSSW + "px";
-}
-
+// both panes share one size (CSS px), filling the window beside the palette
+let CW = 520, CH = 520;
 const lctx = leftCv.getContext("2d");
 const octx = overlayCv.getContext("2d");
-lctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-octx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+function layoutCanvases() {
+  const pal = document.getElementById("palette");
+  const main = document.querySelector("main");
+  const ms = getComputedStyle(main);
+  const padX = parseFloat(ms.paddingLeft) + parseFloat(ms.paddingRight);
+  const padY = parseFloat(ms.paddingTop) + parseFloat(ms.paddingBottom);
+  const gap = parseFloat(ms.columnGap) || 0;
+  const vw = document.documentElement.clientWidth, vh = window.innerHeight;
+  const headH = document.querySelector("header").offsetHeight;
+  const footH = document.querySelector("footer").offsetHeight;
+  CW = Math.max(240, Math.floor((vw - padX - pal.offsetWidth - 2 * gap) / 2));
+  CH = Math.max(240, Math.floor(vh - headH - footH - padY));
+  pal.style.height = CH + "px";
+  for (const cv of [leftCv, rightCv, overlayCv]) {
+    cv.width = Math.round(CW * DPR);
+    cv.height = Math.round(CH * DPR);
+    cv.style.width = CW + "px";
+    cv.style.height = CH + "px";
+  }
+  lctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  octx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+layoutCanvases();
 const gl = rightCv.getContext("webgl2", { antialias: true });
 
 let fnInput = document.getElementById("fn");
@@ -691,6 +713,7 @@ function setFunction(src) {
   state.program = prog;
   state.uRect = gl.getUniformLocation(prog, "uRect");
   state.uView = gl.getUniformLocation(prog, "uView");
+  state.uAspect = gl.getUniformLocation(prog, "uAspect");
   state.uShape = gl.getUniformLocation(prog, "uShape");
   state.uRot = gl.getUniformLocation(prog, "uRot");
   state.uSweep = gl.getUniformLocation(prog, "uSweep");
@@ -702,7 +725,7 @@ function setFunction(src) {
   const u = (n) => gl.getUniformLocation(lprog, n);
   state.lineProgram = lprog;
   state.lu = {
-    rect: u("uRect"), view: u("uView"), shape: u("uShape"), rot: u("uRot"),
+    rect: u("uRect"), view: u("uView"), aspect: u("uAspect"), shape: u("uShape"), rot: u("uRot"),
     step: u("uStep"), halfW: u("uHalfW"), color: u("uColor"),
     tint: u("uTint"), sweep: u("uSweep"),
   };
@@ -721,11 +744,12 @@ function renderRight() {
       gl.useProgram(state.lineProgram);
       gl.bindVertexArray(vaoLine);
       gl.uniform3f(lu.view, v.cx, v.cy, v.half);
+      gl.uniform1f(lu.aspect, CW / CH);
       gl.uniform4f(lu.rect, rect.x, rect.y, rect.w, rect.h);
       gl.uniform1i(lu.shape, shape);
       gl.uniform1i(lu.rot, rot);
       gl.uniform1f(lu.step, 1 / LINE_SEGS);
-      gl.uniform1f(lu.halfW, LINE_HALF_PX * 2 / CSSW);
+      gl.uniform1f(lu.halfW, LINE_HALF_PX * 2 / CH);
       gl.uniform3f(lu.color, rgb[0], rgb[1], rgb[2]);
       gl.uniform4f(lu.tint, ...(tint || [0, 0, 0, 0]));
       gl.uniform1f(lu.sweep, sw);
@@ -742,6 +766,7 @@ function renderRight() {
       gl.useProgram(state.program);
       gl.bindVertexArray(vaoFill);
       gl.uniform3f(state.uView, v.cx, v.cy, v.half);
+      gl.uniform1f(state.uAspect, CW / CH);
       gl.uniform4f(state.uRect, r.x, r.y, r.w, r.h);
       gl.uniform1i(state.uShape, shape);
       gl.uniform1i(state.uRot, layer.rot);
@@ -761,7 +786,7 @@ function renderRight() {
     if (state.sweep !== null) {
       // image of the sweeping ray arg z = θ, long enough to cross the whole z-plane view
       const lv = state.leftView;
-      const R = Math.hypot(Math.abs(lv.cx) + lv.half, Math.abs(lv.cy) + lv.half);
+      const R = Math.hypot(Math.abs(lv.cx) + lv.half * CW / CH, Math.abs(lv.cy) + lv.half);
       const ray = { x: 0, y: 0, w: R * Math.cos(state.sweep), h: R * Math.sin(state.sweep) };
       drawOutline(ray, SHAPE_ID.line, 0, [1, 1, 1], [1, 1, 1, 0.75], 10);
     }
@@ -772,39 +797,39 @@ function renderRight() {
 }
 
 function worldToPix(view, cv, x, y) {
-  const ppu = CSSW / (2 * view.half);
-  return [(x - view.cx) * ppu + CSSW / 2, CSSW / 2 - (y - view.cy) * ppu];
+  const ppu = CH / (2 * view.half);
+  return [(x - view.cx) * ppu + CW / 2, CH / 2 - (y - view.cy) * ppu];
 }
 function pixToWorld(view, cv, px, py) {
-  const ppu = CSSW / (2 * view.half);
-  return [(px - CSSW / 2) / ppu + view.cx, view.cy - (py - CSSW / 2) / ppu];
+  const ppu = CH / (2 * view.half);
+  return [(px - CW / 2) / ppu + view.cx, view.cy - (py - CH / 2) / ppu];
 }
 
 function drawAxes(ctx, cv, view, overlay) {
-  if (overlay) ctx.clearRect(0, 0, CSSW, CSSW);
+  if (overlay) ctx.clearRect(0, 0, CW, CH);
   const step = niceStep(view.half);
   ctx.save();
   ctx.strokeStyle = "rgba(255,255,255,0.08)";
   ctx.fillStyle = "rgba(255,255,255,0.45)";
   ctx.font = "11px sans-serif";
   ctx.lineWidth = 1;
-  const x0 = view.cx - view.half, x1 = view.cx + view.half;
+  const x0 = view.cx - view.half * CW / CH, x1 = view.cx + view.half * CW / CH;
   const y0 = view.cy - view.half, y1 = view.cy + view.half;
   for (let x = Math.ceil(x0 / step) * step; x <= x1; x += step) {
     const [px] = worldToPix(view, cv, x, 0);
-    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, CSSW); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, CH); ctx.stroke();
     if (Math.abs(x) > step / 2) ctx.fillText(fmt(x), px + 3, worldToPix(view, cv, 0, 0)[1] - 4);
   }
   for (let y = Math.ceil(y0 / step) * step; y <= y1; y += step) {
     const [, py] = worldToPix(view, cv, 0, y);
-    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(CSSW, py); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(CW, py); ctx.stroke();
     if (Math.abs(y) > step / 2) ctx.fillText(fmt(y) + "i", worldToPix(view, cv, 0, 0)[0] + 4, py - 3);
   }
   ctx.strokeStyle = "rgba(255,255,255,0.35)";
   const [ax] = worldToPix(view, cv, 0, 0);
   const [, ay] = worldToPix(view, cv, 0, 0);
-  ctx.beginPath(); ctx.moveTo(ax, 0); ctx.lineTo(ax, CSSW); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(0, ay); ctx.lineTo(CSSW, ay); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ax, 0); ctx.lineTo(ax, CH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, ay); ctx.lineTo(CW, ay); ctx.stroke();
   ctx.restore();
 }
 function niceStep(half) {
@@ -850,7 +875,7 @@ function layerAt(wx, wy) {
     if (l.item.shape === "line") {
       const len2 = r.w * r.w + r.h * r.h;
       const t = len2 ? Math.max(0, Math.min(1, ((wx - r.x) * r.w + (wy - r.y) * r.h) / len2)) : 0;
-      const tol = 6 * (2 * state.leftView.half) / CSSW;
+      const tol = 6 * (2 * state.leftView.half) / CH;
       if (Math.hypot(wx - r.x - t * r.w, wy - r.y - t * r.h) <= tol) return l;
     } else if (l.item.shape === "circle") {
       const dx = (wx - r.x - r.w / 2) / (r.w / 2), dy = (wy - r.y - r.h / 2) / (r.h / 2);
@@ -889,9 +914,9 @@ function shapePath(ctx, layer, px, py, pw, ph) {
 
 function renderLeft() {
   const v = state.leftView;
-  lctx.clearRect(0, 0, CSSW, CSSW);
+  lctx.clearRect(0, 0, CW, CH);
   drawAxes(lctx, leftCv, v, false);
-  const ppu = CSSW / (2 * v.half);
+  const ppu = CH / (2 * v.half);
   for (const layer of state.layers) {
     const r = layer.rect;
     const [px, py] = worldToPix(v, leftCv, r.x, r.y + r.h);
@@ -932,7 +957,7 @@ function renderLeft() {
   if (state.sweep !== null) {
     // the sweeping ray arg z = θ from the origin
     const [ox, oy] = worldToPix(v, leftCv, 0, 0);
-    const far = 4 * CSSW;
+    const far = 4 * Math.max(CW, CH);
     lctx.strokeStyle = "rgba(255,255,255,0.75)";
     lctx.lineWidth = 1.5;
     lctx.beginPath();
@@ -956,7 +981,7 @@ function drawGridWindow(layer, px, py, pw, ph) {
   lctx.strokeStyle = col.lineCss;
   lctx.lineWidth = 1 / DPR;
   const sp = GRID_SPACING;
-  if (sp * CSSW / (2 * v.half) >= 3) { // skip when lines would crowd into a solid wash
+  if (sp * CH / (2 * v.half) >= 3) { // skip when lines would crowd into a solid wash
     lctx.beginPath();
     for (let x = Math.ceil(r.x / sp) * sp; x <= r.x + r.w; x += sp) {
       const gx = snap(worldToPix(v, leftCv, x, 0)[0]);
@@ -1033,7 +1058,7 @@ let drag = null;
 // the axis (coordinate 0). Returns the adjusted low coordinate, or null if nothing is close.
 function snapSpan(lo, size, enabled) {
   if (!enabled) return null;
-  const tol = SNAP_PX * (2 * state.leftView.half) / CSSW;
+  const tol = SNAP_PX * (2 * state.leftView.half) / CH;
   let best = null, bestD = tol;
   for (const off of [0, size / 2, size]) {
     const d = Math.abs(lo + off);
@@ -1043,7 +1068,7 @@ function snapSpan(lo, size, enabled) {
 }
 // Snap a single coordinate (a dragged edge) onto the axis.
 function snapCoord(c, enabled) {
-  const tol = SNAP_PX * (2 * state.leftView.half) / CSSW;
+  const tol = SNAP_PX * (2 * state.leftView.half) / CH;
   return enabled && Math.abs(c) <= tol ? 0 : null;
 }
 leftCv.addEventListener("pointerdown", (ev) => {
@@ -1129,7 +1154,7 @@ leftCv.addEventListener("pointermove", (ev) => {
     renderAll();
     return;
   }
-  const ppu = CSSW / (2 * state.leftView.half);
+  const ppu = CH / (2 * state.leftView.half);
   state.leftView.cx -= (ev.offsetX - drag.px) / ppu;
   state.leftView.cy += (ev.offsetY - drag.py) / ppu;
   drag.px = ev.offsetX; drag.py = ev.offsetY;
@@ -1202,7 +1227,7 @@ rightCv.addEventListener("pointerdown", (ev) => {
 });
 rightCv.addEventListener("pointermove", (ev) => {
   if (!rdrag) return;
-  const ppu = CSSW / (2 * state.rightView.half);
+  const ppu = CH / (2 * state.rightView.half);
   state.rightView.cx -= (ev.offsetX - rdrag.px) / ppu;
   state.rightView.cy += (ev.offsetY - rdrag.py) / ppu;
   rdrag.px = ev.offsetX; rdrag.py = ev.offsetY;
@@ -1382,6 +1407,12 @@ playBtn.addEventListener("click", () => {
   renderAll();
   sweepRaf = requestAnimationFrame(step);
 });
+
+// re-fit on window resize, and when the header/footer change height (e.g. MathLive loading)
+const relayout = () => { layoutCanvases(); renderAll(); };
+window.addEventListener("resize", relayout);
+new ResizeObserver(relayout).observe(document.querySelector("header"));
+new ResizeObserver(relayout).observe(document.querySelector("footer"));
 
 /* dismissable pane instructions (dismissal remembered per pane) */
 for (const [id, key] of [["hintLeft", "complexmap.hintL"], ["hintRight", "complexmap.hintR"]]) {

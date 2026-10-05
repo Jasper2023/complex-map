@@ -72,10 +72,10 @@
     background: #14161a; color: #e6e6e6; border: 1px solid #3a4150;
     border-radius: 6px; padding: 6px;
   }
-  main { display: flex; gap: 16px; padding: 16px 18px; flex-wrap: wrap; }
+  main { display: flex; gap: 16px; padding: 16px 18px; }
   #palette {
-    display: flex; flex-direction: column; gap: 10px; width: 92px;
-    max-height: 520px; overflow-y: auto; padding: 8px;
+    display: flex; flex-direction: column; gap: 10px; flex: none;
+    box-sizing: border-box; width: 110px; overflow-y: auto; padding: 8px;
     background: #1d2026; border: 1px solid #2c313a; border-radius: 8px;
     align-items: center;
   }
@@ -162,6 +162,6 @@
 <footer>
   Supports + − * / ^, parentheses, i, pi, e, and sin cos tan sinh cosh tanh exp log sqrt conj abs arg re im. Implicit multiplication works (2iz, z sin(z)).
 </footer>
-<script src="static/main.js?v=lines-sweep"></script>
+<script src="static/main.js?v=full-width"></script>
 </body>
 </html>
