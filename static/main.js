@@ -155,16 +155,26 @@ vec2 cre(vec2 v){ return vec2(v.x, 0.0); }
 vec2 cim(vec2 v){ return vec2(v.y, 0.0); }
 `;
 
+// unit-square coords of the unrotated shape -> z: rotate uRot quarter turns CCW within the
+// square, then stretch onto uRect (whose w/h the CPU already swapped for odd rotations)
+const PLACE_UV = `
+vec2 placeUV(vec2 uv){
+  for (int k = 0; k < 3; k++) { if (k >= uRot) break; uv = vec2(1.0 - uv.y, uv.x); }
+  return uRect.xy + uv * uRect.zw;
+}`;
+
 function vertexSrc(fExpr) {
   return `#version 300 es
 precision highp float;
 in vec2 aUV;
 uniform vec4 uRect;   // layer rect in z-plane: x, y (bottom-left), w, h
 uniform vec3 uView;   // w-plane view: center x, center y, half-extent
-uniform int uShape;   // 0 = rect, 1 = circle (ellipse inscribed in uRect)
+uniform int uShape;   // 0 = rect, 1 = circle (ellipse inscribed in uRect), 2 = semicircle
+uniform int uRot;     // semicircle: quarter turns counter-clockwise
 out vec2 vUV;
 out vec2 vZ;
 ${GLSL_LIB}
+${PLACE_UV}
 vec2 f(vec2 z){ return ${fExpr}; }
 void main(){
   vec2 z;
@@ -172,6 +182,10 @@ void main(){
     // polar mesh: aUV.x = radius fraction, aUV.y = angle fraction
     float a = aUV.y * 6.28318530718;
     z = uRect.xy + uRect.zw * 0.5 * (1.0 + aUV.x * vec2(cos(a), sin(a)));
+  } else if (uShape == 2) {
+    // half-polar mesh over the upper half-disk, then rotated into place
+    float a = aUV.y * 3.14159265359;
+    z = placeUV(vec2(0.5 + 0.5 * aUV.x * cos(a), aUV.x * sin(a)));
   } else {
     z = uRect.xy + aUV * uRect.zw;
   }
@@ -188,6 +202,14 @@ void main(){
 }`;
 }
 
+// sweep animation: only the part of the z-plane with arg z in [0, uSweep] is laid down
+const SWEEP_CLIP = `
+void sweepClip(vec2 z){
+  float a = atan(z.y, z.x);
+  if (a < 0.0) a += 6.28318530718;
+  if (a > uSweep) discard;
+}`;
+
 const FRAG_SRC = `#version 300 es
 precision highp float;
 in vec2 vUV;
@@ -198,7 +220,9 @@ uniform vec3 uFill;
 uniform vec3 uLine;
 uniform float uSpacing;
 uniform float uDpr;
+uniform float uSweep;
 out vec4 outColor;
+${SWEEP_CLIP}
 // coverage of the grid lines (one family per axis) at this fragment, as hairlines of
 // constant screen width: distance to the nearest line is measured in device pixels
 // via the screen-space gradient of z, so lines never thicken or blur under f
@@ -213,6 +237,7 @@ float hairlines(float sp){
   return max(cov.x, cov.y);
 }
 void main(){
+  sweepClip(vZ);
   if (uIsGrid == 1) {
     // world-aligned graph paper: hairlines every uSpacing
     outColor = vec4(mix(uFill, uLine, hairlines(uSpacing)), 1.0);
@@ -234,15 +259,26 @@ in vec3 aSeg;         // segment start t in [0,1), end flag (0/1), side (-1/+1)
 uniform vec4 uRect;
 uniform vec3 uView;
 uniform int uShape;
+uniform int uRot;
 uniform float uStep;  // boundary parameter per segment
 uniform float uHalfW; // half line width, clip units
+out vec2 vZ;
 ${GLSL_LIB}
+${PLACE_UV}
 vec2 f(vec2 z){ return ${fExpr}; }
 vec2 boundary(float t){
+  // segment from uRect.xy along the signed vector uRect.zw; open, so no wrap-around
+  if (uShape == 3) return uRect.xy + clamp(t, 0.0, 1.0) * uRect.zw;
   t = fract(t);
   if (uShape == 1) {
     float a = t * 6.28318530718;
     return uRect.xy + uRect.zw * 0.5 * (1.0 + vec2(cos(a), sin(a)));
+  }
+  if (uShape == 2) {
+    // arc (right end -> left end), then the diameter back; split by arc length
+    const float PI = 3.14159265359, TA = PI / (PI + 2.0);
+    if (t < TA) { float a = t / TA * PI; return placeUV(vec2(0.5 + 0.5 * cos(a), sin(a))); }
+    return placeUV(vec2((t - TA) / (1.0 - TA), 0.0));
   }
   // rect, counter-clockwise from bottom-left
   float s = t * 4.0, side = floor(s), u = s - side;
@@ -258,7 +294,8 @@ vec2 toClip(vec2 w){ return (clamp(w, vec2(-1e5), vec2(1e5)) - uView.xy) / uView
 const float JUMP = 0.5; // clip-space segment length treated as a discontinuity
 void main(){
   float t = aSeg.x + aSeg.y * uStep;
-  vec2 wa = f(boundary(t - uStep)), wc = f(boundary(t)), wb = f(boundary(t + uStep));
+  vZ = boundary(t);
+  vec2 wa = f(boundary(t - uStep)), wc = f(vZ), wb = f(boundary(t + uStep));
   vec2 pa = toClip(wa), pc = toClip(wc), pb = toClip(wb);
   // the other end of this vertex's own segment
   bool partnerBad = aSeg.y < 0.5 ? bad(wb) : bad(wa);
@@ -286,9 +323,16 @@ void main(){
 
 const LINE_FRAG_SRC = `#version 300 es
 precision highp float;
+in vec2 vZ;
 uniform vec3 uColor;
+uniform vec4 uTint;   // rgb + alpha override (alpha 0 = use uColor)
+uniform float uSweep;
 out vec4 outColor;
-void main(){ outColor = vec4(uColor, 1.0); }`;
+${SWEEP_CLIP}
+void main(){
+  sweepClip(vZ);
+  outColor = uTint.a > 0.0 ? uTint : vec4(uColor, 1.0);
+}`;
 
 /* ============ app state ============ */
 
@@ -313,13 +357,13 @@ const gl = rightCv.getContext("webgl2", { antialias: true });
 let fnInput = document.getElementById("fn");
 const errEl = document.getElementById("err");
 const photosEl = document.getElementById("photos");
-const rectsEl = document.getElementById("rects");
-const circlesEl = document.getElementById("circles");
+const shapesEl = document.getElementById("shapes");
 
 const state = {
   palette: [],                              // {id, source, aspect, tex}
   layers: [],                               // {item, rect:{x,y,w,h}, filled} in draw order
   selected: null,                           // a layer, or null
+  sweep: null,                              // sweep animation angle, or null when not sweeping
   leftView: { cx: 0, cy: 0, half: 3 },
   rightView: { cx: 0, cy: 0, half: 4 },
   program: null,
@@ -420,14 +464,24 @@ function paletteDom(item, thumbCanvas, label, sectionEl) {
     });
     div.appendChild(del);
   } else {
-    // filled / outline toggle: sets how this tile lands on the plane
+    // color (bottom-left) and filled / outline (bottom-right) toggles: set how this tile lands
+    const col = document.createElement("button");
+    col.className = "pcolor";
+    col.title = "color — click to cycle";
     const tog = document.createElement("button");
     tog.className = "pfill";
     const sync = () => {
+      col.style.background = COLORS[item.color].fillCss;
       tog.textContent = item.filled ? "●" : "○";
       tog.title = item.filled ? "filled — click for outline only" : "outline — click for filled";
       drawShapeThumb(thumbCanvas, item);
     };
+    col.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      item.color = (item.color + 1) % COLORS.length;
+      sync();
+      scheduleSave();
+    });
     tog.addEventListener("click", (ev) => {
       ev.stopPropagation();
       item.filled = !item.filled;
@@ -436,7 +490,8 @@ function paletteDom(item, thumbCanvas, label, sectionEl) {
     });
     item.syncToggle = sync;
     sync();
-    div.appendChild(tog);
+    div.appendChild(col);
+    if (item.shape !== "line") div.appendChild(tog);
   }
   sectionEl.appendChild(div);
 }
@@ -469,27 +524,43 @@ function hexToRgb(h) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
 
-function addGridItem(fillHex, lineHex, lineAlpha, label, shape) {
+// grid colors: fill, line base color, line opacity over the fill
+const COLORS = [
+  ["#e8eaee", "#000000", 0.35],
+  ["#e0483f", "#ffffff", 0.55],
+  ["#2e9e58", "#ffffff", 0.55],
+  ["#3672e0", "#ffffff", 0.55],
+  ["#8b5cf6", "#ffffff", 0.55],
+].map(([fillHex, lineHex, lineAlpha]) => {
   const fill = hexToRgb(fillHex);
   const base = hexToRgb(lineHex);
   const line = fill.map((c, i) => Math.round(c * (1 - lineAlpha) + base[i] * lineAlpha));
-  const item = {
-    id: nextId++,
-    kind: "grid",
-    shape,                                  // "rect" | "circle"
-    filled: true,                           // palette toggle: how new layers land
-    aspect: 1,
+  return {
     fill: fill.map((c) => c / 255),
     line: line.map((c) => c / 255),
     fillCss: fillHex,
     lineCss: `rgb(${line.join(",")})`,
     thumbLineCss: `rgba(${base.join(",")},${lineAlpha})`,
   };
+});
+
+const SHAPE_ASPECT = { rect: 1, circle: 1, semicircle: 0.5, line: 0 }; // h / w, unrotated
+const SHAPE_ID = { rect: 0, circle: 1, semicircle: 2, line: 3 };     // uShape in the shaders
+
+function addShapeItem(shape, color, label) {
+  const item = {
+    id: nextId++,
+    kind: "grid",
+    shape,                                  // "rect" | "circle" | "semicircle" | "line"
+    color,                                  // palette toggles: how new layers land
+    filled: true,
+    aspect: SHAPE_ASPECT[shape],
+  };
   state.palette.push(item);
   const thumb = document.createElement("canvas");
   thumb.width = thumb.height = Math.round(72 * DPR);
   thumb.style.width = thumb.style.height = "72px";
-  paletteDom(item, thumb, label, shape === "circle" ? circlesEl : rectsEl);
+  paletteDom(item, thumb, label, shapesEl);
   return item;
 }
 
@@ -510,25 +581,37 @@ const GRID_SPACING = 0.25;
 function drawShapeThumb(c, item) {
   const S = c.width;
   const g = c.getContext("2d");
+  const col = COLORS[item.color];
   g.clearRect(0, 0, S, S);
-  if (!item.filled) {
-    g.strokeStyle = item.fillCss;
-    g.lineWidth = 3 * DPR;
-    const m = 8 * DPR;
+  const outlinePath = (m) => {
     g.beginPath();
     if (item.shape === "circle") g.arc(S / 2, S / 2, S / 2 - m, 0, 2 * Math.PI);
-    else g.rect(m, m, S - 2 * m, S - 2 * m);
+    else if (item.shape === "semicircle") {
+      g.arc(S / 2, S * 0.75 - m / 2, S / 2 - m, Math.PI, 2 * Math.PI);
+      g.closePath();
+    } else g.rect(m, m, S - 2 * m, S - 2 * m);
+  };
+  if (item.shape === "line") {
+    g.strokeStyle = col.fillCss;
+    g.lineWidth = 3 * DPR;
+    g.lineCap = "round";
+    g.beginPath(); g.moveTo(12 * DPR, S - 12 * DPR); g.lineTo(S - 12 * DPR, 12 * DPR); g.stroke();
+    return;
+  }
+  if (!item.filled) {
+    g.strokeStyle = col.fillCss;
+    g.lineWidth = 3 * DPR;
+    outlinePath(8 * DPR);
     g.stroke();
     return;
   }
   g.save();
-  if (item.shape === "circle") {
-    g.beginPath();
-    g.arc(S / 2, S / 2, S / 2 - DPR, 0, 2 * Math.PI);
+  if (item.shape !== "rect") {
+    outlinePath(DPR);
     g.clip();
   }
-  const line = item.thumbLineCss;
-  g.fillStyle = item.fillCss;
+  const line = col.thumbLineCss;
+  g.fillStyle = col.fillCss;
   g.fillRect(0, 0, S, S);
   g.strokeStyle = line;
   g.lineWidth = DPR;
@@ -547,7 +630,8 @@ function drawShapeThumb(c, item) {
 function addLayer(item, cx, cy, width) {
   const w = width || state.leftView.half * 0.66;
   const h = w * item.aspect;
-  const layer = { item, rect: { x: cx - w / 2, y: cy - h / 2, w, h }, filled: item.kind !== "grid" || item.filled };
+  const layer = { item, rect: { x: cx - w / 2, y: cy - h / 2, w, h }, filled: true, color: 0, rot: 0 };
+  if (item.kind === "grid") { layer.filled = item.filled; layer.color = item.color; }
   state.layers.push(layer);
   state.selected = layer;
   renderAll();
@@ -608,6 +692,8 @@ function setFunction(src) {
   state.uRect = gl.getUniformLocation(prog, "uRect");
   state.uView = gl.getUniformLocation(prog, "uView");
   state.uShape = gl.getUniformLocation(prog, "uShape");
+  state.uRot = gl.getUniformLocation(prog, "uRot");
+  state.uSweep = gl.getUniformLocation(prog, "uSweep");
   state.uIsGrid = gl.getUniformLocation(prog, "uIsGrid");
   state.uFill = gl.getUniformLocation(prog, "uFill");
   state.uLine = gl.getUniformLocation(prog, "uLine");
@@ -616,8 +702,9 @@ function setFunction(src) {
   const u = (n) => gl.getUniformLocation(lprog, n);
   state.lineProgram = lprog;
   state.lu = {
-    rect: u("uRect"), view: u("uView"), shape: u("uShape"),
+    rect: u("uRect"), view: u("uView"), shape: u("uShape"), rot: u("uRot"),
     step: u("uStep"), halfW: u("uHalfW"), color: u("uColor"),
+    tint: u("uTint"), sweep: u("uSweep"),
   };
 }
 
@@ -628,20 +715,28 @@ function renderRight() {
   gl.clear(gl.COLOR_BUFFER_BIT);
   if (state.program) {
     const v = state.rightView;
+    const sweep = state.sweep ?? 10; // > 2π: everything visible
+    const lu = state.lu;
+    const drawOutline = (rect, shape, rot, rgb, tint, sw) => {
+      gl.useProgram(state.lineProgram);
+      gl.bindVertexArray(vaoLine);
+      gl.uniform3f(lu.view, v.cx, v.cy, v.half);
+      gl.uniform4f(lu.rect, rect.x, rect.y, rect.w, rect.h);
+      gl.uniform1i(lu.shape, shape);
+      gl.uniform1i(lu.rot, rot);
+      gl.uniform1f(lu.step, 1 / LINE_SEGS);
+      gl.uniform1f(lu.halfW, LINE_HALF_PX * 2 / CSSW);
+      gl.uniform3f(lu.color, rgb[0], rgb[1], rgb[2]);
+      gl.uniform4f(lu.tint, ...(tint || [0, 0, 0, 0]));
+      gl.uniform1f(lu.sweep, sw);
+      gl.drawArrays(gl.TRIANGLES, 0, LINE_SEGS * 6);
+    };
     for (const layer of state.layers) {
       const r = layer.rect, it = layer.item;
-      const shape = it.shape === "circle" ? 1 : 0;
-      if (!layer.filled) {
-        const lu = state.lu;
-        gl.useProgram(state.lineProgram);
-        gl.bindVertexArray(vaoLine);
-        gl.uniform3f(lu.view, v.cx, v.cy, v.half);
-        gl.uniform4f(lu.rect, r.x, r.y, r.w, r.h);
-        gl.uniform1i(lu.shape, shape);
-        gl.uniform1f(lu.step, 1 / LINE_SEGS);
-        gl.uniform1f(lu.halfW, LINE_HALF_PX * 2 / CSSW);
-        gl.uniform3f(lu.color, it.fill[0], it.fill[1], it.fill[2]);
-        gl.drawArrays(gl.TRIANGLES, 0, LINE_SEGS * 6);
+      const shape = SHAPE_ID[it.shape] || 0;
+      const col = COLORS[layer.color];
+      if (!layer.filled || it.shape === "line") {
+        drawOutline(r, shape, layer.rot, col.fill, null, sweep);
         continue;
       }
       gl.useProgram(state.program);
@@ -649,10 +744,12 @@ function renderRight() {
       gl.uniform3f(state.uView, v.cx, v.cy, v.half);
       gl.uniform4f(state.uRect, r.x, r.y, r.w, r.h);
       gl.uniform1i(state.uShape, shape);
+      gl.uniform1i(state.uRot, layer.rot);
+      gl.uniform1f(state.uSweep, sweep);
       if (it.kind === "grid") {
         gl.uniform1i(state.uIsGrid, 1);
-        gl.uniform3f(state.uFill, it.fill[0], it.fill[1], it.fill[2]);
-        gl.uniform3f(state.uLine, it.line[0], it.line[1], it.line[2]);
+        gl.uniform3f(state.uFill, col.fill[0], col.fill[1], col.fill[2]);
+        gl.uniform3f(state.uLine, col.line[0], col.line[1], col.line[2]);
         gl.uniform1f(state.uSpacing, GRID_SPACING);
         gl.uniform1f(state.uDpr, DPR);
       } else {
@@ -660,6 +757,13 @@ function renderRight() {
         gl.bindTexture(gl.TEXTURE_2D, it.tex);
       }
       gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+    }
+    if (state.sweep !== null) {
+      // image of the sweeping ray arg z = θ, long enough to cross the whole z-plane view
+      const lv = state.leftView;
+      const R = Math.hypot(Math.abs(lv.cx) + lv.half, Math.abs(lv.cy) + lv.half);
+      const ray = { x: 0, y: 0, w: R * Math.cos(state.sweep), h: R * Math.sin(state.sweep) };
+      drawOutline(ray, SHAPE_ID.line, 0, [1, 1, 1], [1, 1, 1, 0.75], 10);
     }
     gl.bindVertexArray(null);
   }
@@ -720,8 +824,11 @@ const HANDLE = 5;      // half-size of corner handle, px
 const HANDLE_HIT = 9;  // hit-test radius, px
 
 // corners of a layer in pixel coords, order: BL, BR, TL, TR (world orientation)
+// (lines: just the two endpoints)
 function layerCornersPix(layer) {
   const r = layer.rect, v = state.leftView;
+  if (layer.item.shape === "line")
+    return [worldToPix(v, leftCv, r.x, r.y), worldToPix(v, leftCv, r.x + r.w, r.y + r.h)];
   return [
     worldToPix(v, leftCv, r.x, r.y),
     worldToPix(v, leftCv, r.x + r.w, r.y),
@@ -732,7 +839,7 @@ function layerCornersPix(layer) {
 function hitCorner(layer, px, py) {
   if (!layer) return -1;
   const cs = layerCornersPix(layer);
-  for (let c = 0; c < 4; c++) {
+  for (let c = 0; c < cs.length; c++) {
     if (Math.abs(px - cs[c][0]) <= HANDLE_HIT && Math.abs(py - cs[c][1]) <= HANDLE_HIT) return c;
   }
   return -1;
@@ -740,19 +847,44 @@ function hitCorner(layer, px, py) {
 function layerAt(wx, wy) {
   for (let i = state.layers.length - 1; i >= 0; i--) {
     const l = state.layers[i], r = l.rect;
-    if (l.item.shape === "circle") {
+    if (l.item.shape === "line") {
+      const len2 = r.w * r.w + r.h * r.h;
+      const t = len2 ? Math.max(0, Math.min(1, ((wx - r.x) * r.w + (wy - r.y) * r.h) / len2)) : 0;
+      const tol = 6 * (2 * state.leftView.half) / CSSW;
+      if (Math.hypot(wx - r.x - t * r.w, wy - r.y - t * r.h) <= tol) return l;
+    } else if (l.item.shape === "circle") {
       const dx = (wx - r.x - r.w / 2) / (r.w / 2), dy = (wy - r.y - r.h / 2) / (r.h / 2);
       if (dx * dx + dy * dy <= 1) return l;
+    } else if (l.item.shape === "semicircle") {
+      // back to the unrotated unit square (inverse of placeUV's quarter turns)
+      let u = (wx - r.x) / r.w, v = (wy - r.y) / r.h;
+      for (let k = 0; k < l.rot; k++) [u, v] = [v, 1 - u];
+      if (v >= 0 && (2 * u - 1) ** 2 + v * v <= 1) return l;
     } else if (wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h) return l;
   }
   return null;
 }
 
-// adds the layer's outline (rect or inscribed ellipse) to the current path
+// unit-square coords of the unrotated shape -> world (mirrors the shaders' placeUV)
+function placeUV(layer, u, v) {
+  for (let k = 0; k < layer.rot; k++) [u, v] = [1 - v, u];
+  const r = layer.rect;
+  return [r.x + u * r.w, r.y + v * r.h];
+}
+
+// adds the layer's outline (rect, inscribed ellipse or semicircle) to the current path
 function shapePath(ctx, layer, px, py, pw, ph) {
   ctx.beginPath();
   if (layer.item.shape === "circle") ctx.ellipse(px + pw / 2, py + ph / 2, pw / 2, ph / 2, 0, 0, 2 * Math.PI);
-  else ctx.rect(px, py, pw, ph);
+  else if (layer.item.shape === "semicircle") {
+    for (let i = 0; i <= 96; i++) {
+      const a = Math.PI * i / 96;
+      const [x, y] = placeUV(layer, 0.5 + 0.5 * Math.cos(a), Math.sin(a));
+      const [sx, sy] = worldToPix(state.leftView, leftCv, x, y);
+      i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy);
+    }
+    ctx.closePath();
+  } else ctx.rect(px, py, pw, ph);
 }
 
 function renderLeft() {
@@ -763,9 +895,16 @@ function renderLeft() {
   for (const layer of state.layers) {
     const r = layer.rect;
     const [px, py] = worldToPix(v, leftCv, r.x, r.y + r.h);
-    if (layer.item.kind === "grid" && !layer.filled) {
+    if (layer.item.shape === "line") {
+      const [ax, ay] = worldToPix(v, leftCv, r.x, r.y);
+      const [bx, by] = worldToPix(v, leftCv, r.x + r.w, r.y + r.h);
+      lctx.strokeStyle = COLORS[layer.color].fillCss;
+      lctx.lineWidth = LINE_HALF_PX * 2;
+      lctx.lineCap = "round";
+      lctx.beginPath(); lctx.moveTo(ax, ay); lctx.lineTo(bx, by); lctx.stroke();
+    } else if (layer.item.kind === "grid" && !layer.filled) {
       shapePath(lctx, layer, px, py, r.w * ppu, r.h * ppu);
-      lctx.strokeStyle = layer.item.fillCss;
+      lctx.strokeStyle = COLORS[layer.color].fillCss;
       lctx.lineWidth = LINE_HALF_PX * 2;
       lctx.stroke();
     } else if (layer.item.kind === "grid") {
@@ -779,7 +918,7 @@ function renderLeft() {
     const [px, py] = worldToPix(v, leftCv, r.x, r.y + r.h);
     lctx.strokeStyle = "rgba(120,170,255,0.9)";
     lctx.lineWidth = 1.5;
-    lctx.strokeRect(px, py, r.w * ppu, r.h * ppu);
+    if (state.selected.item.shape !== "line") lctx.strokeRect(px, py, r.w * ppu, r.h * ppu);
     lctx.fillStyle = "#fff";
     lctx.strokeStyle = "rgba(0,0,0,0.5)";
     lctx.lineWidth = 1;
@@ -790,20 +929,31 @@ function renderLeft() {
       lctx.stroke();
     }
   }
+  if (state.sweep !== null) {
+    // the sweeping ray arg z = θ from the origin
+    const [ox, oy] = worldToPix(v, leftCv, 0, 0);
+    const far = 4 * CSSW;
+    lctx.strokeStyle = "rgba(255,255,255,0.75)";
+    lctx.lineWidth = 1.5;
+    lctx.beginPath();
+    lctx.moveTo(ox, oy);
+    lctx.lineTo(ox + far * Math.cos(state.sweep), oy - far * Math.sin(state.sweep));
+    lctx.stroke();
+  }
   scheduleSave();
 }
 
 // draw a grid layer in the z-plane as a window onto the fixed world-aligned grid
 function drawGridWindow(layer, px, py, pw, ph) {
-  const v = state.leftView, r = layer.rect, it = layer.item;
+  const v = state.leftView, r = layer.rect, col = COLORS[layer.color];
   // hairlines: one device pixel wide at any zoom, snapped to pixel centers
   const snap = (p) => (Math.floor(p * DPR) + 0.5) / DPR;
   lctx.save();
   shapePath(lctx, layer, px, py, pw, ph);
   lctx.clip();
-  lctx.fillStyle = it.fillCss;
+  lctx.fillStyle = col.fillCss;
   lctx.fillRect(px, py, pw, ph);
-  lctx.strokeStyle = it.lineCss;
+  lctx.strokeStyle = col.lineCss;
   lctx.lineWidth = 1 / DPR;
   const sp = GRID_SPACING;
   if (sp * CSSW / (2 * v.half) >= 3) { // skip when lines would crowd into a solid wash
@@ -855,10 +1005,10 @@ function saveState() {
       leftView: state.leftView,
       rightView: state.rightView,
       photos: photos.map((p) => ({ url: p.dataURL || (p.dataURL = shrinkToDataURL(p.source)) })),
-      tileFilled: grids.map((g) => g.filled),
+      tiles: grids.map((g) => ({ shape: g.shape, color: g.color, filled: g.filled })),
       layers: state.layers.map((l) =>
         l.item.kind === "grid"
-          ? { kind: "grid", i: grids.indexOf(l.item), rect: l.rect, filled: l.filled }
+          ? { kind: "shape", shape: l.item.shape, color: l.color, filled: l.filled, rot: l.rot, rect: l.rect }
           : { kind: "photo", i: photos.indexOf(l.item), rect: l.rect }
       ),
     };
@@ -899,13 +1049,15 @@ function snapCoord(c, enabled) {
 leftCv.addEventListener("pointerdown", (ev) => {
   const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
   const corner = hitCorner(state.selected, ev.offsetX, ev.offsetY);
-  if (corner >= 0) {
+  if (corner >= 0 && state.selected.item.shape === "line") {
+    drag = { mode: "endpoint", layer: state.selected, end: corner };
+  } else if (corner >= 0) {
     const r = state.selected.rect;
     // anchor = opposite corner stays fixed
     const anchorX = corner & 1 ? r.x : r.x + r.w;
     const anchorY = corner & 2 ? r.y : r.y + r.h;
     drag = { mode: "resize", layer: state.selected, anchorX, anchorY, aspect: r.h / r.w,
-             lockAspect: state.selected.item.shape === "circle" };
+             lockAspect: state.selected.item.shape === "circle" || state.selected.item.shape === "semicircle" };
   } else {
     const layer = layerAt(wx, wy);
     if (layer) {
@@ -926,8 +1078,23 @@ leftCv.addEventListener("pointermove", (ev) => {
     const c = hitCorner(state.selected, ev.offsetX, ev.offsetY);
     const [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
     leftCv.style.cursor = c >= 0
-      ? (c === 0 || c === 3 ? "nesw-resize" : "nwse-resize")
+      ? (state.selected.item.shape === "line" ? "move" : c === 0 || c === 3 ? "nesw-resize" : "nwse-resize")
       : (layerAt(wx, wy) ? "grab" : "default");
+    return;
+  }
+  if (drag.mode === "endpoint") {
+    let [wx, wy] = pixToWorld(state.leftView, leftCv, ev.offsetX, ev.offsetY);
+    wx = snapCoord(wx, !ev.altKey) ?? wx;
+    wy = snapCoord(wy, !ev.altKey) ?? wy;
+    const r = drag.layer.rect;
+    if (drag.end === 0) {
+      // move the start, keep the end fixed
+      const ex = r.x + r.w, ey = r.y + r.h;
+      r.x = wx; r.y = wy; r.w = ex - wx; r.h = ey - wy;
+    } else {
+      r.w = wx - r.x; r.h = wy - r.y;
+    }
+    renderAll();
     return;
   }
   if (drag.mode === "resize") {
@@ -1002,8 +1169,19 @@ leftCv.addEventListener("drop", (ev) => {
 
 window.addEventListener("keydown", (ev) => {
   if (document.activeElement === fnInput) return;
+  if ((ev.key === "r" || ev.key === "R") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    const l = state.selected;
+    if (l && l.item.shape === "semicircle") {
+      const r = l.rect, cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+      l.rot = (l.rot + 1) % 4;
+      [r.w, r.h] = [r.h, r.w];
+      r.x = cx - r.w / 2; r.y = cy - r.h / 2;
+      renderAll();
+    }
+    return;
+  }
   if ((ev.key === "f" || ev.key === "F") && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
-    if (state.selected && state.selected.item.kind === "grid") {
+    if (state.selected && state.selected.item.kind === "grid" && state.selected.item.shape !== "line") {
       state.selected.filled = !state.selected.filled;
       renderAll();
     }
@@ -1179,6 +1357,32 @@ document.getElementById("file").addEventListener("change", (ev) => {
   ev.target.value = "";
 });
 
+/* sweep animation: lay the z-plane down onto the w-plane by arg z, 0 -> 2π */
+const SWEEP_MS = 4000;
+const playBtn = document.getElementById("playBtn");
+let sweepRaf = 0;
+function stopSweep() {
+  cancelAnimationFrame(sweepRaf);
+  state.sweep = null;
+  playBtn.textContent = "▶ sweep";
+  renderAll();
+}
+playBtn.addEventListener("click", () => {
+  if (state.sweep !== null) { stopSweep(); return; }
+  playBtn.textContent = "■ stop";
+  const t0 = performance.now();
+  const step = (now) => {
+    const t = (now - t0) / SWEEP_MS;
+    if (t >= 1) { stopSweep(); return; }
+    state.sweep = 2 * Math.PI * t;
+    renderAll();
+    sweepRaf = requestAnimationFrame(step);
+  };
+  state.sweep = 0;
+  renderAll();
+  sweepRaf = requestAnimationFrame(step);
+});
+
 /* dismissable pane instructions (dismissal remembered per pane) */
 for (const [id, key] of [["hintLeft", "complexmap.hintL"], ["hintRight", "complexmap.hintR"]]) {
   const el = document.getElementById(id);
@@ -1193,19 +1397,12 @@ for (const [id, key] of [["hintLeft", "complexmap.hintL"], ["hintRight", "comple
 }
 
 /* ---- boot ---- */
-const GRID_TILES = [
-  ["#e8eaee", "#000000", 0.35],
-  ["#e0483f", "#ffffff", 0.55],
-  ["#2e9e58", "#ffffff", 0.55],
-  ["#3672e0", "#ffffff", 0.55],
-  ["#8b5cf6", "#ffffff", 0.55],
-];
-let firstTile = null;
-for (const shape of ["rect", "circle"])
-  for (const [fill, lineBase, alpha] of GRID_TILES) {
-    const item = addGridItem(fill, lineBase, alpha, `${fill} ${shape === "circle" ? "circle" : "rectangle"}`, shape);
-    if (fill === "#8b5cf6" && shape === "rect") firstTile = item;
-  }
+const shapeItems = {
+  rect: addShapeItem("rect", 4, "rectangle"),
+  circle: addShapeItem("circle", 3, "circle"),
+  semicircle: addShapeItem("semicircle", 2, "semicircle"),
+  line: addShapeItem("line", 1, "line"),
+};
 
 const saved = loadState();
 if (saved && Array.isArray(saved.layers)) {
@@ -1215,10 +1412,13 @@ if (saved && Array.isArray(saved.layers)) {
     if (customElements.get("math-field")) fnInput.value = saved.fn;
     else fnInput.textContent = saved.fn; // MathLive reads content when it upgrades
   }
-  const gridItems = state.palette.filter((p) => p.kind === "grid");
-  (saved.tileFilled || []).forEach((f, i) => {
-    if (gridItems[i] && f === false) { gridItems[i].filled = false; gridItems[i].syncToggle(); }
-  });
+  for (const t of saved.tiles || []) {
+    const it = shapeItems[t.shape];
+    if (!it) continue;
+    if (COLORS[t.color]) it.color = t.color;
+    it.filled = t.filled !== false;
+    it.syncToggle();
+  }
   Promise.all(
     (saved.photos || []).map(
       (p) =>
@@ -1231,13 +1431,24 @@ if (saved && Array.isArray(saved.layers)) {
     )
   ).then((photoItems) => {
     for (const l of saved.layers) {
-      const item = l.kind === "grid" ? gridItems[l.i] : photoItems[l.i];
-      if (item && l.rect) state.layers.push({ item, rect: l.rect, filled: item.kind !== "grid" || l.filled !== false });
+      if (!l.rect) continue;
+      if (l.kind === "photo") {
+        if (photoItems[l.i]) state.layers.push({ item: photoItems[l.i], rect: l.rect, filled: true, color: 0, rot: 0 });
+        continue;
+      }
+      // "grid" = older saves: index into 5 rect tiles then 5 circle tiles, one per color
+      const shape = l.kind === "grid" ? (l.i < 5 ? "rect" : "circle") : l.shape;
+      const color = l.kind === "grid" ? l.i % 5 : l.color;
+      if (!shapeItems[shape]) continue;
+      state.layers.push({
+        item: shapeItems[shape], rect: l.rect, filled: l.filled !== false,
+        color: COLORS[color] ? color : 0, rot: l.rot | 0,
+      });
     }
     renderAll();
   });
 } else {
-  addLayer(firstTile, 0, 0, 2);
+  addLayer(shapeItems.rect, 0, 0, 2);
   state.selected = null;
 }
 applyFunction();
